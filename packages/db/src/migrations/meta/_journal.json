@@ -1919,6 +1919,13 @@
       "when": 1789222639601,
       "tag": "0275_fat_shaman",
       "breakpoints": true
+    },
+    {
+      "idx": 276,
+      "version": "7",
+      "when": 1789222697544,
+      "tag": "0276_greedy_whizzer",
+      "breakpoints": true
     }
   ]
 }
