@@ -115,8 +115,11 @@ is terminal. Two sweeper passes cover the cases where that `finally` never ran
   removed without manual ops intervention.
 
 A dir is removed only when its marker is valid, it is older than a 60-minute
-grace period (so a run terminalizing at sweep time is not raced), and its runId
-is terminal or no longer exists in the database. Runs still queued or running
+grace period (so a run terminalizing at sweep time is not raced), its runId
+is terminal or no longer exists in the database, and the run's process group
+is no longer alive (mirroring the executor's `process_group_alive` cleanup
+skip, so a winding-down run never loses its scratch under an active process).
+Runs still queued or running
 are left alone. Removal first does a best-effort recursive `chmod` (dirs
 `u+rwx`, files `u+rw`) because tool caches such as go module caches can leave
 read-only files behind that would otherwise make `fs.rm` fail with `EACCES`.

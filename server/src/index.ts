@@ -119,7 +119,7 @@ import {
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
-import { startRunScratchSweeper } from "./services/run-scratch-sweeper.js";
+import { startRunScratchSweeper, type RunScratchSweeperHandle } from "./services/run-scratch-sweeper.js";
 import {
   createEmbeddedPostgresSupervisor,
   type EmbeddedPostgresSupervisor,
@@ -1171,7 +1171,11 @@ async function startServerWithDatabaseTeardown(
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
   };
-  const runScratchSweeper = startRunScratchSweeper({ db: db as any });
+  // Assigned inside the `if (heartbeat)` block after orphaned-run recovery so
+  // the sweeper's startup-delay timer and 6h interval never fire while
+  // recovery is still reconciling run records (Greptile P1: "Sweep Runs
+  // Before Recovery"); shutdown stops it via optional chaining.
+  let runScratchSweeper: RunScratchSweeperHandle | null = null;
   const externalObjects = externalObjectService(db as any, {
     pluginWorkerManager,
     enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
@@ -1594,6 +1598,10 @@ async function startServerWithDatabaseTeardown(
     // restart, so a leaked sandbox does not stay allocated across the restart.
     await runEnvironmentLeaseCleanupSweep(0);
 
+    // Arm the orphaned run-scratch sweeper only now — after orphaned-run
+    // recovery has settled.
+    runScratchSweeper = startRunScratchSweeper({ db: db as any });
+
     // Run the orphaned run-scratch sweep once at startup, so scratch dirs that
     // leaked when a previous process crashed mid-run (their `finally` never
     // executed) are removed before timer ticks start.
@@ -1607,6 +1615,7 @@ async function startServerWithDatabaseTeardown(
               removed: result.removed,
               removedDirs: result.removedDirs,
               skippedLiveRun: result.skippedLiveRun,
+              skippedProcessGroupAlive: result.skippedProcessGroupAlive,
               failed: result.failed,
             },
             "startup orphaned run scratch sweep complete",
@@ -1930,9 +1939,8 @@ async function startServerWithDatabaseTeardown(
   ) => {
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
-    heartbeatSchedulerStopped = true;
     clearInterval(executionControlInterval);
-    runScratchSweeper.stop();
+    runScratchSweeper?.stop();
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;

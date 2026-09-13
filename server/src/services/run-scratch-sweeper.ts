@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { isProcessGroupAlive } from "./local-service-supervisor.js";
 import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   readHeartbeatRunScratchMarker,
@@ -31,6 +32,7 @@ export interface OrphanedRunScratchSweepResult {
   removed: number;
   removedDirs: string[];
   skippedLiveRun: number;
+  skippedProcessGroupAlive: number;
   skippedTooYoung: number;
   skippedUnreadable: number;
   failed: Array<{ dir: string; error: string }>;
@@ -38,7 +40,7 @@ export interface OrphanedRunScratchSweepResult {
 
 export type LoadHeartbeatRunStatus = (
   runId: string,
-) => Promise<{ status: string | null } | null>;
+) => Promise<{ status: string | null; processGroupId: number | null } | null>;
 
 export interface SweepOrphanedRunScratchDirsInput {
   db?: Db;
@@ -49,6 +51,8 @@ export interface SweepOrphanedRunScratchDirsInput {
   tmpRoot?: string;
   /** Injectable run-status loader; defaults to a heartbeatRuns lookup. */
   loadRun?: LoadHeartbeatRunStatus;
+  /** Injectable process-group liveness probe; defaults to the local supervisor check. */
+  isProcessGroupAlive?: (processGroupId: number | null | undefined) => boolean;
 }
 
 /**
@@ -95,7 +99,10 @@ async function chmodRecursiveForRemoval(dir: string): Promise<void> {
  *   - it is older than the grace period, and
  *   - its runId is terminal or no longer exists in the database.
  * Dirs whose run is still queued/running are live and left alone; the next
- * sweep (or the run's own finally) cleans them up.
+ * sweep (or the run's own finally) cleans them up. Terminal runs whose process
+ * group is still alive (mirroring the executor's `process_group_alive` cleanup
+ * skip) are also left alone, so a winding-down run never loses its scratch
+ * under an active process.
  */
 export async function sweepOrphanedRunScratchDirs(
   input: SweepOrphanedRunScratchDirsInput = {},
@@ -109,19 +116,24 @@ export async function sweepOrphanedRunScratchDirs(
     (db
       ? async (runId) => {
           const rows = await db
-            .select({ status: heartbeatRuns.status })
+            .select({
+              status: heartbeatRuns.status,
+              processGroupId: heartbeatRuns.processGroupId,
+            })
             .from(heartbeatRuns)
             .where(eq(heartbeatRuns.id, runId))
             .limit(1);
           return rows[0] ?? null;
         }
       : null);
+  const processGroupAlive = input.isProcessGroupAlive ?? isProcessGroupAlive;
 
   const result: OrphanedRunScratchSweepResult = {
     scanned: 0,
     removed: 0,
     removedDirs: [],
     skippedLiveRun: 0,
+    skippedProcessGroupAlive: 0,
     skippedTooYoung: 0,
     skippedUnreadable: 0,
     failed: [],
@@ -177,8 +189,10 @@ export async function sweepOrphanedRunScratchDirs(
     }
 
     let runStatus: string | null | undefined;
+    let run: { status: string | null; processGroupId: number | null } | null |
+      undefined;
     try {
-      const run = await loadRun(marker.runId);
+      run = await loadRun(marker.runId);
       runStatus = run?.status ?? null;
     } catch (err) {
       logger.warn(
@@ -190,6 +204,12 @@ export async function sweepOrphanedRunScratchDirs(
     }
     if (runStatus != null && !TERMINAL_RUN_STATUSES.has(runStatus)) {
       result.skippedLiveRun += 1;
+      continue;
+    }
+    // A run can already be terminal in the database while its process group is
+    // still winding down; the executor's own cleanup skips those too.
+    if (processGroupAlive(run?.processGroupId ?? null) === true) {
+      result.skippedProcessGroupAlive += 1;
       continue;
     }
 
@@ -243,6 +263,7 @@ export function startRunScratchSweeper(input: {
           removed: result.removed,
           removedDirs: result.removedDirs,
           skippedLiveRun: result.skippedLiveRun,
+          skippedProcessGroupAlive: result.skippedProcessGroupAlive,
           skippedTooYoung: result.skippedTooYoung,
           failed: result.failed,
         },

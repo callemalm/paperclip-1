@@ -78,10 +78,44 @@ describe("sweepOrphanedRunScratchDirs", () => {
       now: new Date(Date.now() + DEFAULT_RUN_SCRATCH_SWEEP_MIN_AGE_MS + 1000),
       tmpRoot: root,
       loadRun: async (runId) =>
-        runId === "run-failed" ? { status: "failed" } : null,
+        runId === "run-failed"
+          ? { status: "failed", processGroupId: null }
+          : null,
     });
 
     expect(result.removed).toBe(1);
+    await expect(fs.stat(scratch.dir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("leaves a terminal run's scratch dir while its process group is still alive", async () => {
+    const root = await makeTmpRoot();
+    const scratch = await prepareIn(root, { runId: "run-pg-alive" });
+
+    const result = await sweepOrphanedRunScratchDirs({
+      now: new Date(Date.now() + DEFAULT_RUN_SCRATCH_SWEEP_MIN_AGE_MS + 1000),
+      tmpRoot: root,
+      loadRun: async () => ({ status: "succeeded", processGroupId: 424242 }),
+      isProcessGroupAlive: (pgid) => pgid === 424242,
+    });
+
+    expect(result.removed).toBe(0);
+    expect(result.skippedProcessGroupAlive).toBe(1);
+    await expect(fs.stat(scratch.dir)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+  });
+
+  it("removes a terminal run's scratch dir once its process group is gone", async () => {
+    const root = await makeTmpRoot();
+    const scratch = await prepareIn(root, { runId: "run-pg-dead" });
+
+    const result = await sweepOrphanedRunScratchDirs({
+      now: new Date(Date.now() + DEFAULT_RUN_SCRATCH_SWEEP_MIN_AGE_MS + 1000),
+      tmpRoot: root,
+      loadRun: async () => ({ status: "failed", processGroupId: 424243 }),
+      isProcessGroupAlive: (pgid) => pgid === 424242,
+    });
+
+    expect(result.removed).toBe(1);
+    expect(result.skippedProcessGroupAlive).toBe(0);
     await expect(fs.stat(scratch.dir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -93,7 +127,9 @@ describe("sweepOrphanedRunScratchDirs", () => {
       now: new Date(Date.now() + DEFAULT_RUN_SCRATCH_SWEEP_MIN_AGE_MS + 1000),
       tmpRoot: root,
       loadRun: async (runId) =>
-        runId === "run-live" ? { status: "running" } : null,
+        runId === "run-live"
+          ? { status: "running", processGroupId: null }
+          : null,
     });
 
     expect(result.removed).toBe(0);
@@ -108,7 +144,7 @@ describe("sweepOrphanedRunScratchDirs", () => {
     const result = await sweepOrphanedRunScratchDirs({
       now: new Date(Date.now() + 1000),
       tmpRoot: root,
-      loadRun: async () => ({ status: "succeeded" }),
+      loadRun: async () => ({ status: "succeeded", processGroupId: null }),
     });
 
     expect(result.removed).toBe(0);
@@ -129,7 +165,7 @@ describe("sweepOrphanedRunScratchDirs", () => {
     const result = await sweepOrphanedRunScratchDirs({
       now: new Date(Date.now() + DEFAULT_RUN_SCRATCH_SWEEP_MIN_AGE_MS + 1000),
       tmpRoot: root,
-      loadRun: async () => ({ status: "timed_out" }),
+      loadRun: async () => ({ status: "timed_out", processGroupId: null }),
     });
 
     expect(result.removed).toBe(1);
@@ -204,7 +240,7 @@ describe("startRunScratchSweeper", () => {
       intervalMs: 60_000,
       minAgeMs: 0,
       tmpRoot: root,
-      loadRun: async () => ({ status: "cancelled" }),
+      loadRun: async () => ({ status: "cancelled", processGroupId: null }),
     });
     try {
       const result = await sweeper.sweepOnce();
