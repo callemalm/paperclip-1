@@ -38,7 +38,7 @@ describe("isPendingHumanReviewHold", () => {
     ))).toBe(false);
     expect(isPendingHumanReviewHold(pendingReviewState(
       { type: "user", userId: boardUserId, agentId: null },
-      { currentStageType: "signoff" },
+      { currentStageType: "approval" },
     ))).toBe(false);
     expect(isPendingHumanReviewHold(null)).toBe(false);
   });
