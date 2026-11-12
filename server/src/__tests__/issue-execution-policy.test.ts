@@ -2322,3 +2322,97 @@ describe("review round circuit breaker", () => {
     });
   });
 });
+
+describe("escalated hold + board-sentinel resolver (SAT-18026)", () => {
+  // Live shape from SAT-17601/SAT-17287: an agent review stage exhausted its
+  // changes-requested rounds and escalated to the responsible human, which on
+  // agent-created ops cards is the `local-board` sentinel. The board operator
+  // resolving the close-intent is a DISTINCT instance-admin user id.
+  const policy = reviewOnlyPolicy();
+  const reviewStageId = policy.stages[0].id;
+
+  function sentinelHoldIssue() {
+    return {
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      responsibleUserId: "local-board",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: "local-board" },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: "changes_requested",
+        changesRequestedCount: 3,
+      },
+    };
+  }
+
+  it("advances the escalated sentinel hold for a distinct instance-admin board resolver", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: sentinelHoldIssue(),
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: null, userId: boardUserId },
+      commentBody: "Board-accepted close",
+      onBehalfOfBoardSentinel: true,
+    });
+
+    expect(result.decision).toMatchObject({
+      stageId: reviewStageId,
+      stageType: "review",
+      outcome: "approved",
+    });
+    expect(result.patch.executionState).toMatchObject({
+      status: "completed",
+      lastDecisionOutcome: "approved",
+    });
+  });
+
+  it("still rejects a distinct resolver without the instance-admin flag (fail-closed)", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: sentinelHoldIssue(),
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: null, userId: boardUserId },
+        commentBody: "Board-accepted close",
+      }),
+    ).toThrow("Only the escalated reviewer can advance the current execution stage");
+  });
+
+  it("still rejects an agent actor even with the flag (widening is human-only)", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: sentinelHoldIssue(),
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Agent trying to ride the sentinel widening",
+        onBehalfOfBoardSentinel: true,
+      }),
+    ).toThrow("Only the escalated reviewer can advance the current execution stage");
+  });
+
+  it("keeps exact-match sentinel resolver behavior unchanged", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: sentinelHoldIssue(),
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: null, userId: "local-board" },
+      commentBody: "Sentinel self-close",
+    });
+
+    expect(result.decision).toMatchObject({ outcome: "approved" });
+    expect(result.patch.executionState).toMatchObject({ status: "completed" });
+  });
+});

@@ -53,6 +53,16 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  /**
+   * SAT-17823 CR round-1 Finding 1: the caller has already established that
+   * the actor (an authenticated human board operator) holds the stage on
+   * behalf of the `local-board` board-sentinel principal recorded on the
+   * escalated hold. When true, the participant/actor comparison below
+   * canonicalizes the board principal instead of requiring exact id
+   * equality. Default false — every other caller keeps exact equality
+   * (fail-closed).
+   */
+  onBehalfOfBoardSentinel?: boolean;
 };
 
 type TransitionResult = {
@@ -441,6 +451,48 @@ function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecuti
   return a.type === "agent" ? a.agentId === b.agentId : a.userId === b.userId;
 }
 
+/**
+ * The `local-board` sentinel user records the board itself on agent-created
+ * ops cards (responsible-user sentinel). Escalated review holds created from
+ * those cards carry it as the stage's human participant.
+ */
+export const BOARD_SENTINEL_USER_ID = "local-board";
+
+export function isBoardSentinelUserPrincipal(
+  participant: IssueExecutionStagePrincipal | null | undefined,
+): boolean {
+  return Boolean(
+    participant
+    && participant.type === "user"
+    && participant.userId === BOARD_SENTINEL_USER_ID,
+  );
+}
+
+/**
+ * SAT-17823 CR round-1 Finding 1: canonicalize the board principal when
+ * comparing the held stage's participant to the acting human. A
+ * `local-board` sentinel participant is held by the instance's board
+ * operator (an authenticated instance admin with their own user id), so a
+ * DISTINCT human user counts as the holder. Exact equality always holds
+ * first; the sentinel widening only fires when `onBehalfOfBoardSentinel`
+ * was established by the caller (the verdict-advance machinery verifies
+ * instance-admin authority with a live DB check before setting it).
+ */
+function actorHoldsParticipant(
+  participant: IssueExecutionStagePrincipal | null,
+  actor: IssueExecutionStagePrincipal | null,
+  onBehalfOfBoardSentinel: boolean | undefined,
+): boolean {
+  if (principalsEqual(participant, actor)) return true;
+  if (!onBehalfOfBoardSentinel) return false;
+  return Boolean(
+    isBoardSentinelUserPrincipal(participant)
+    && actor?.type === "user"
+    && actor.userId
+    && actor.userId !== BOARD_SENTINEL_USER_ID,
+  );
+}
+
 function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
   return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
@@ -740,7 +792,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       currentParticipant.type === "user" &&
       !stageHasParticipant(activeStage, currentParticipant) &&
       (existingState?.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(input.policy);
-    if (escalatedHold && !principalsEqual(currentParticipant, actor)) {
+    if (escalatedHold && !actorHoldsParticipant(currentParticipant, actor, input.onBehalfOfBoardSentinel)) {
       // An empty patch would not override the caller's own requested fields,
       // so a status or assignee change from a non-escalated actor must be
       // rejected outright — mirroring the "only the active participant can
@@ -799,7 +851,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       };
     }
 
-    if (principalsEqual(currentParticipant, actor)) {
+    if (actorHoldsParticipant(currentParticipant, actor, input.onBehalfOfBoardSentinel)) {
       if (requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
